@@ -1,13 +1,15 @@
 from fastapi import FastAPI , UploadFile , File , HTTPException ,Depends,Query
 from pydantic import BaseModel
-import os
+import os 
 import google.generativeai as genai
 os.environ["USE_TF"] = "0"
 from sentence_transformers import SentenceTransformer
 from concurrent.futures import ThreadPoolExecutor
-import codecs , asyncio ,uuid 
+import codecs , uuid 
+from contextlib import asynccontextmanager
 import numpy as np
 import chromadb
+import asyncio
 # Data model for text input.
 class EmbedInput(BaseModel):
     text : str
@@ -39,7 +41,6 @@ async def Embed_text( input_data : EmbedInput ):
     return { 
         "text" : input_data.text ,
         "language" : input_data.language,
-        "Note" : input_data.note,
         "vector":vector
         }
 
@@ -62,51 +63,82 @@ def split_text(text:str, chunk_size:int = 500 ,overlap :int=50) -> list[str]:
     
     return chunks
 
-# Endpoint for file upload.
+# Endpoint for file upload (streaming style)
 @app.post("/api/v1/embed/file")
-async def Embed_file(file : UploadFile = File(...), chunk_size: int = 100, overlap: int = 20):
-    # Incremental UTF-8 decoder (avoids encoding errors and handles big files safely).
+async def Embed_file(file: UploadFile = File(...), chunk_size: int = 100, overlap: int = 20):
     decoder = codecs.getincrementaldecoder("utf-8")()
-    parts :list[str] =[] # store file parts
-    total =0             # track total bytes read.
-    max_bytes = 50 * 1024 * 1024     # 50 MB max size.
-    
-    # Read the file in chunks (64 KB each time).
+    buffer = []   # Temporary buffer to accumulate words until chunk_size is reached
+    total = 0
+    max_bytes = 50 * 1024 * 1024   # Max allowed file size: 50MB
+
+    chunks, vectors, ids, metadatas = [], [], [], []
+
+    # Read file piece by piece (64KB each time)
     while True:
-        chunk = await file.read()
+        chunk = await file.read(64 * 1024)
         if not chunk:
-            break   
-        parts.append(decoder.decode(chunk))
-        total = total + len(chunk)
+            break
 
-        # If file exceeds size limit -> return error.
+        total += len(chunk)
         if total > max_bytes:
-            raise HTTPException(413,"The file is too long")
+            raise HTTPException(413, "The file is too long")
 
-    # Join all parts into full text and Splitting into a chunks.
-    full_text =("").join(parts)
-    chunks = split_text(full_text,chunk_size,overlap)
-    vectors = [embed_text_with_model(chunk) for chunk in chunks]
+        # Decode to text and split into words
+        text_piece = decoder.decode(chunk)
+        words = text_piece.split()
 
-    ids = [str(uuid.uuid4())for _ in range(len(chunks))]
-    metadatas = []
-    for i,chunk in enumerate(chunks):
-        start_char = sum(len(c) for c in chunks[:i])
-        end_char = start_char + len(chunk)
+        # Add words to buffer and create chunks when enough words are available
+        buffer.extend(words)
+        while len(buffer) >= chunk_size:
+            current_chunk = " ".join(buffer[:chunk_size])
+            chunks.append(current_chunk)
+
+            # Create embedding for the current chunk
+            vector = embed_text_with_model(current_chunk)
+            vectors.append(vector)
+
+            # Assign unique ID and metadata
+            ids.append(str(uuid.uuid4()))
+            metadatas.append({
+                "source": file.filename,
+                "chunk_index": len(chunks) - 1,
+                "preview": current_chunk[:150],   # Small snippet for quick inspection
+                "words_count": len(current_chunk.split())
+            })
+
+            # Keep the overlap words in buffer and discard the rest
+            buffer = buffer[chunk_size - overlap:]
+
+    # Handle leftover words in buffer (last incomplete chunk)
+    if buffer:
+        current_chunk = " ".join(buffer)
+        chunks.append(current_chunk)
+
+        vector = embed_text_with_model(current_chunk)
+        vectors.append(vector)
+        ids.append(str(uuid.uuid4()))
         metadatas.append({
-            "source": file.filename,         
-            "chunk_index": i,               
-            "preview": chunk[:150],        
-            "words_count": len(chunk.split())
+            "source": file.filename,
+            "chunk_index": len(chunks) - 1,
+            "preview": current_chunk[:150],
+            "words_count": len(current_chunk.split())
         })
-    collection.add(documents=chunks, embeddings=vectors, ids=ids, metadatas=metadatas)
 
-    return{
+    # Add processed chunks to ChromaDB
+    if chunks:
+        collection.add(
+            documents=chunks,
+            embeddings=vectors,
+            ids=ids,
+            metadatas=metadatas
+        )
+
+    return {
         "file name": file.filename,
         "file type": file.content_type,
-        "total chunk":len(chunks),
-        "vector" : vectors
+        "total chunks": len(chunks)
     }
+
 chroma_client = chromadb.PersistentClient(path="chroma_data")
 
 try:
