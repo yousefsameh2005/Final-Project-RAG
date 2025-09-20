@@ -120,7 +120,6 @@ async def Embed_file(file: UploadFile = File(...), chunk_size: int = 100, overla
         metadatas.append({
             "source": file.filename,
             "chunk_index": len(chunks) - 1,
-            "preview": current_chunk[:150],
             "words_count": len(current_chunk.split())
         })
 
